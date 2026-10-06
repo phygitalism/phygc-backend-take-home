@@ -1,0 +1,113 @@
+x-app: &app
+  build: .
+  image: genpipe-app
+  volumes:
+    - .:/srv
+  environment: &app-env
+    GP_DATABASE_URL: postgresql+psycopg://genpipe:genpipe@postgres:5432/genpipe
+    GP_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+    GP_REDIS_URL: redis://redis:6379/0
+    GP_PROVIDER_BASE_URL: http://provider-mock:9000
+    GP_PROVIDER_API_KEY: ${GP_PROVIDER_API_KEY:-dev-provider-key}
+    GP_PROVIDER_WEBHOOK_SECRET: ${GP_PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret}
+    GP_PUBLIC_BASE_URL: http://api:8000
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: genpipe
+      POSTGRES_PASSWORD: genpipe
+      POSTGRES_DB: genpipe
+    volumes:
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Over TCP on purpose: the init-time server only listens on the unix socket.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U genpipe -d genpipe"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  provider-mock:
+    <<: *app
+    command: uvicorn provider_mock.main:app --host 0.0.0.0 --port 9000
+    environment:
+      MOCK_API_KEY: ${GP_PROVIDER_API_KEY:-dev-provider-key}
+      MOCK_WEBHOOK_SECRET: ${GP_PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret}
+      MOCK_RATE_429: "0.10"
+      MOCK_RATE_5XX: "0.10"
+      MOCK_RATE_GENERATION_FAILS: "0.10"
+      MOCK_RATE_DUPLICATE_EVENT: "0.20"
+      MOCK_RATE_REORDERED_EVENTS: "0.15"
+      MOCK_RATE_INSTANT: "0.15"
+      MOCK_RATE_CANCEL_TOO_LATE: "0.30"
+      MOCK_MIN_SECONDS: "2"
+      MOCK_MAX_SECONDS: "8"
+    ports:
+      - "9000:9000"
+
+  api:
+    <<: *app
+    command: >
+      sh -c "python -m app.scripts.init_db &&
+             uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: celery -A app.worker.celery_app:celery_app worker --loglevel=INFO --concurrency=4
+    depends_on:
+      api:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+
+  beat:
+    <<: *app
+    command: celery -A app.worker.celery_app:celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  tests:
+    <<: *app
+    profiles: ["test"]
+    command: pytest
+    environment:
+      <<: *app-env
+      GP_DATABASE_URL: postgresql+psycopg://genpipe:genpipe@postgres:5432/genpipe_test
+      GP_CELERY_ALWAYS_EAGER: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
